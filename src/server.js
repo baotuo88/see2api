@@ -120,31 +120,46 @@ function normalizeVideoUrl(v) {
 }
 
 function makeGenerationResponse(job) {
+  const phase = job.status === "queued" ? "queued" : job.status === "processing" ? "processing" : job.status;
   return {
     id: job.id,
     object: "video.generation",
+    type: "video_generation",
+    task_type: "video_generation",
     created: job.created,
     model: job.model,
     status: job.status,
+    state: phase,
+    runtimePhase: phase,
     error: job.error || null,
-    output: job.output || []
+    output: job.output || [],
+    data: job.output || []
   };
 }
 
 function makeResponsesStyle(job) {
+  const phase = job.status === "queued" ? "queued" : job.status === "processing" ? "processing" : job.status;
+  const outputs = (job.output || []).map((item, idx) => ({
+    type: "output_video",
+    task_type: "video_generation",
+    id: `outvid_${job.id}_${idx + 1}`,
+    url: item.url,
+    mime_type: item.mime_type || "video/mp4",
+    video_url: item.url
+  }));
   return {
     id: `resp_${job.id}`,
     object: "response",
+    type: "video_generation",
+    task_type: "video_generation",
     created_at: job.created,
     status: job.status,
+    state: phase,
+    runtimePhase: phase,
     model: job.model,
     error: job.error || null,
-    output: (job.output || []).map((item, idx) => ({
-      type: "output_video",
-      id: `outvid_${job.id}_${idx + 1}`,
-      url: item.url,
-      mime_type: item.mime_type || "video/mp4"
-    }))
+    output: outputs,
+    data: outputs
   };
 }
 
@@ -542,6 +557,34 @@ async function handleCreateImageVideo(req, res) {
 app.post("/v1/videos/image-to-video", authAndRateLimit, upload.single("image"), handleCreateImageVideo);
 app.post("/v1/video/image-to-video", authAndRateLimit, upload.single("image"), handleCreateImageVideo);
 
+app.post("/v1/responses", authAndRateLimit, async (req, res) => {
+  const model = String(req.body?.model || "").trim();
+  const modalities = Array.isArray(req.body?.modalities) ? req.body.modalities.map((v) => String(v).toLowerCase()) : [];
+  const wantsVideo = model.includes("seedance") || modalities.includes("video");
+  if (!wantsVideo) {
+    return res.status(400).json({
+      error: { code: "unsupported_modality", message: "Only video generation is supported on this proxy" }
+    });
+  }
+
+  const fakeReq = {
+    ...req,
+    body: {
+      ...req.body,
+      prompt: extractPrompt(req.body),
+      aspect_ratio: normalizeAspectRatio(req.body),
+      n: req.body?.n ?? req.body?.num_outputs ?? 1,
+      response_format: "responses"
+    },
+    query: {
+      ...req.query,
+      format: "responses"
+    }
+  };
+
+  return handleCreateTextVideo(fakeReq, res);
+});
+
 app.get("/v1/videos/generations/:id", authAndRateLimit, async (req, res) => {
   const job = await getJobState(req.params.id);
   if (!job) {
@@ -551,6 +594,16 @@ app.get("/v1/videos/generations/:id", authAndRateLimit, async (req, res) => {
   const format = String(req.query.format || "generation");
   if (format === "responses") return res.json(makeResponsesStyle(job));
   return res.json(makeGenerationResponse(job));
+});
+
+app.get("/v1/responses/:id", authAndRateLimit, async (req, res) => {
+  const raw = String(req.params.id || "");
+  const id = raw.startsWith("resp_") ? raw.slice(5) : raw;
+  const job = await getJobState(id);
+  if (!job) {
+    return res.status(404).json({ error: { code: "not_found", message: "response id not found" } });
+  }
+  return res.json(makeResponsesStyle(job));
 });
 
 app.listen(PORT, HOST, () => {
