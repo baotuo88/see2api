@@ -21,8 +21,9 @@ const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "127.0.0.1";
 const PAGE_URL = process.env.SEEDANCE_PAGE_URL || "https://veoaifree.com/seedance-2-0-video-generator-free/";
 const AJAX_URL = process.env.SEEDANCE_AJAX_URL || "https://veoaifree.com/wp-admin/admin-ajax.php";
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 10000);
-const MAX_POLL_ATTEMPTS = Number(process.env.MAX_POLL_ATTEMPTS || 18);
+const INITIAL_POLL_DELAY_MS = Number(process.env.INITIAL_POLL_DELAY_MS || 85000);
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 20000);
+const MAX_POLL_ATTEMPTS = Number(process.env.MAX_POLL_ATTEMPTS || 36);
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 30000);
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const QUEUE_NAME = process.env.QUEUE_NAME || "seedance-video-jobs";
@@ -119,26 +120,59 @@ function normalizeVideoUrl(v) {
   return s.replace("videos/", "video/");
 }
 
+function isUpstreamError(text) {
+  if (text.length <= 15) return false;
+  return text.includes("Rate Limit") || text.includes("Error") || text.includes("retry");
+}
+
+function isInvalidNonceMarker(text) {
+  const t = text.trim();
+  return t === "0" || t === "-1";
+}
+
+function toApiStatus(s) {
+  if (s === "succeeded") return "completed";
+  if (s === "processing") return "in_progress";
+  return s;
+}
+
+function toProgress(s) {
+  if (s === "succeeded") return 100;
+  if (s === "processing") return 50;
+  return 0;
+}
+
 function makeGenerationResponse(job) {
-  const phase = job.status === "queued" ? "queued" : job.status === "processing" ? "processing" : job.status;
+  const apiStatus = toApiStatus(job.status);
+  const progress = toProgress(job.status);
+  const firstUrl = job.output?.[0]?.url || null;
+  const completedAt = job.status === "succeeded" ? Math.floor(Date.now() / 1000) : null;
   return {
     id: job.id,
     object: "video.generation",
     type: "video_generation",
     task_type: "video_generation",
     created: job.created,
+    created_at: job.created,
+    completed_at: completedAt,
     model: job.model,
-    status: job.status,
-    state: phase,
-    runtimePhase: phase,
+    status: apiStatus,
+    state: apiStatus,
+    runtimePhase: apiStatus,
+    progress,
     error: job.error || null,
     output: job.output || [],
-    data: job.output || []
+    data: job.output || [],
+    video_url: firstUrl,
+    url: firstUrl
   };
 }
 
 function makeResponsesStyle(job) {
-  const phase = job.status === "queued" ? "queued" : job.status === "processing" ? "processing" : job.status;
+  const apiStatus = toApiStatus(job.status);
+  const progress = toProgress(job.status);
+  const firstUrl = job.output?.[0]?.url || null;
+  const completedAt = job.status === "succeeded" ? Math.floor(Date.now() / 1000) : null;
   const outputs = (job.output || []).map((item, idx) => ({
     type: "output_video",
     task_type: "video_generation",
@@ -153,13 +187,17 @@ function makeResponsesStyle(job) {
     type: "video_generation",
     task_type: "video_generation",
     created_at: job.created,
-    status: job.status,
-    state: phase,
-    runtimePhase: phase,
+    completed_at: completedAt,
+    status: apiStatus,
+    state: apiStatus,
+    runtimePhase: apiStatus,
+    progress,
     model: job.model,
     error: job.error || null,
     output: outputs,
-    data: outputs
+    data: outputs,
+    video_url: firstUrl,
+    url: firstUrl
   };
 }
 
@@ -253,6 +291,62 @@ async function markFailed(job, code, message) {
   jobCounter.labels(job.kind, "failed").inc();
 }
 
+async function pollFinalVideo(job, sceneText, initialNonce) {
+  let nonce = initialNonce;
+  let nonceRefreshed = false;
+
+  await sleep(INITIAL_POLL_DELAY_MS);
+
+  for (let i = 1; i <= MAX_POLL_ATTEMPTS; i++) {
+    const out = await postAjax({
+      action: "veo_video_generator",
+      nonce,
+      sceneData: sceneText,
+      actionType: "final-video-results"
+    }, "final-video-results");
+
+    const text = String(out || "").trim();
+
+    if (!text) {
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
+
+    if (isInvalidNonceMarker(text)) {
+      if (!nonceRefreshed) {
+        nonce = await getNonce(true);
+        nonceRefreshed = true;
+        continue;
+      }
+      await markFailed(job, "upstream_invalid_nonce", `Upstream rejected nonce (returned "${text}")`);
+      return;
+    }
+
+    if (isUpstreamError(text)) {
+      await markFailed(job, "upstream_error", text.slice(0, 400));
+      return;
+    }
+
+    if (text.startsWith("http://") || text.startsWith("https://")) {
+      job.status = "succeeded";
+      job.output = [{ url: normalizeVideoUrl(text), mime_type: "video/mp4" }];
+      job.updated = nowIso();
+      await setJobState(job.id, job);
+      jobCounter.labels(job.kind, "succeeded").inc();
+      return;
+    }
+
+    job.meta.lastPollRaw = text.slice(0, 300);
+    job.meta.pollAttempts = i;
+    job.updated = nowIso();
+    await setJobState(job.id, job);
+
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  await markFailed(job, "upstream_timeout", "Timed out while polling final video result");
+}
+
 async function processTextToVideo(job) {
   let nonce = await getNonce(false);
 
@@ -284,40 +378,7 @@ async function processTextToVideo(job) {
     return;
   }
 
-  for (let i = 1; i <= MAX_POLL_ATTEMPTS; i++) {
-    await sleep(POLL_INTERVAL_MS);
-
-    const out = await postAjax({
-      action: "veo_video_generator",
-      nonce,
-      sceneData: sceneText,
-      actionType: "final-video-results"
-    }, "final-video-results");
-
-    const text = String(out || "").trim();
-    const lower = text.toLowerCase();
-
-    if (!text) continue;
-    if (lower.includes("rate limit") || lower.includes("error") || lower.includes("retry")) {
-      await markFailed(job, "upstream_error", text.slice(0, 400));
-      return;
-    }
-    if (text.startsWith("http://") || text.startsWith("https://")) {
-      job.status = "succeeded";
-      job.output = [{ url: normalizeVideoUrl(text), mime_type: "video/mp4" }];
-      job.updated = nowIso();
-      await setJobState(job.id, job);
-      jobCounter.labels(job.kind, "succeeded").inc();
-      return;
-    }
-
-    job.meta.lastPollRaw = text.slice(0, 300);
-    job.meta.pollAttempts = i;
-    job.updated = nowIso();
-    await setJobState(job.id, job);
-  }
-
-  await markFailed(job, "upstream_timeout", "Timed out while polling final video result");
+  await pollFinalVideo(job, sceneText, nonce);
 }
 
 async function processImageToVideo(job) {
@@ -353,39 +414,7 @@ async function processImageToVideo(job) {
     return;
   }
 
-  for (let i = 1; i <= MAX_POLL_ATTEMPTS; i++) {
-    await sleep(POLL_INTERVAL_MS);
-    const out = await postAjax({
-      action: "veo_video_generator",
-      nonce,
-      sceneData: sceneText,
-      actionType: "final-video-results"
-    }, "final-video-results");
-
-    const text = String(out || "").trim();
-    const lower = text.toLowerCase();
-
-    if (!text) continue;
-    if (lower.includes("rate limit") || lower.includes("error") || lower.includes("retry")) {
-      await markFailed(job, "upstream_error", text.slice(0, 400));
-      return;
-    }
-    if (text.startsWith("http://") || text.startsWith("https://")) {
-      job.status = "succeeded";
-      job.output = [{ url: normalizeVideoUrl(text), mime_type: "video/mp4" }];
-      job.updated = nowIso();
-      await setJobState(job.id, job);
-      jobCounter.labels(job.kind, "succeeded").inc();
-      return;
-    }
-
-    job.meta.lastPollRaw = text.slice(0, 300);
-    job.meta.pollAttempts = i;
-    job.updated = nowIso();
-    await setJobState(job.id, job);
-  }
-
-  await markFailed(job, "upstream_timeout", "Timed out while polling final video result");
+  await pollFinalVideo(job, sceneText, nonce);
 }
 
 async function authAndRateLimit(req, res, next) {
@@ -512,6 +541,7 @@ async function handleCreateTextVideo(req, res) {
 
 app.post("/v1/videos/generations", authAndRateLimit, handleCreateTextVideo);
 app.post("/v1/video/generations", authAndRateLimit, handleCreateTextVideo);
+app.post("/v1/videos", authAndRateLimit, handleCreateTextVideo);
 
 async function handleCreateImageVideo(req, res) {
   const file = req.file;
@@ -591,6 +621,16 @@ app.get("/v1/videos/generations/:id", authAndRateLimit, async (req, res) => {
     return res.status(404).json({ error: { code: "not_found", message: "generation id not found" } });
   }
 
+  const format = String(req.query.format || "generation");
+  if (format === "responses") return res.json(makeResponsesStyle(job));
+  return res.json(makeGenerationResponse(job));
+});
+
+app.get("/v1/videos/:id", authAndRateLimit, async (req, res) => {
+  const job = await getJobState(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: { code: "not_found", message: "video id not found" } });
+  }
   const format = String(req.query.format || "generation");
   if (format === "responses") return res.json(makeResponsesStyle(job));
   return res.json(makeGenerationResponse(job));

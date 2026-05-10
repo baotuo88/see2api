@@ -150,8 +150,9 @@ curl -s 'http://127.0.0.1:8080/metrics'
 - `JOB_TTL_SECONDS` default `86400`
 - `SEEDANCE_PAGE_URL` default `https://veoaifree.com/seedance-2-0-video-generator-free/`
 - `SEEDANCE_AJAX_URL` default `https://veoaifree.com/wp-admin/admin-ajax.php`
-- `POLL_INTERVAL_MS` default `10000`
-- `MAX_POLL_ATTEMPTS` default `18`
+- `POLL_INTERVAL_MS` default `20000`
+- `MAX_POLL_ATTEMPTS` default `36`
+- `INITIAL_POLL_DELAY_MS` default `85000` (matches upstream's first-poll wait)
 - `REQUEST_TIMEOUT_MS` default `30000`
 
 ## Notes
