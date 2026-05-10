@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: seedance2-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  proxy:
+    build: .
+    container_name: seedance2-proxy
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      REDIS_URL: redis://redis:6379
+      API_KEY: ${API_KEY:-change_me}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-30}
+      REQUEST_TIMEOUT_MS: ${REQUEST_TIMEOUT_MS:-30000}
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-10000}
+      MAX_POLL_ATTEMPTS: ${MAX_POLL_ATTEMPTS:-18}
+    expose:
+      - "8787"
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: seedance2-nginx
+    restart: unless-stopped
+    depends_on:
+      - proxy
+    ports:
+      - "8086:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+volumes:
+  redis_data:
